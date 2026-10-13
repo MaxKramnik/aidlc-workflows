@@ -6702,7 +6702,12 @@ export interface ProcessIdentity {
   startTime: string | null;
 }
 
-const SESSION_ANCESTRY_BUDGET_MS = 50;
+// The whole time one walk may spend finding its chat. macOS reads the process
+// table with one `ps -A`, about 16 ms on an idle machine and several times that
+// on a busy one, so it gets longer; Linux and Windows read each hop natively.
+export function sessionAncestryBudgetMs(): number {
+  return sessionProcessPlatform() === "darwin" ? 250 : 50;
+}
 const SESSION_ANCESTRY_MAX_DEPTH = 64;
 const SESSION_ANCESTRY_CACHE_MS = 1000;
 const sessionAncestryCache = new Map<
@@ -6827,7 +6832,7 @@ let windowsSessionProcessApi: ReturnType<typeof loadWindowsSessionProcessApi> | 
 // independent of the lock subsystem's process probes.
 export function windowsSessionProcessIdentity(
   pid: number,
-  deadlineMs = Date.now() + SESSION_ANCESTRY_BUDGET_MS,
+  deadlineMs = Date.now() + sessionAncestryBudgetMs(),
 ): ProcessIdentity | null {
   // A test platform override must never load Windows DLLs on another host.
   if (
@@ -6983,7 +6988,7 @@ export function writeSessionPidEntry(
   projectDir: string,
   pid: number,
   sessionId: string,
-  deadlineMs: number = Date.now() + SESSION_ANCESTRY_BUDGET_MS,
+  deadlineMs: number = Date.now() + sessionAncestryBudgetMs(),
   identity: ProcessIdentity | null | undefined = undefined,
 ): void {
   sessionAncestryCache.delete(projectDir);
@@ -7064,7 +7069,7 @@ export function writeSessionPidAncestry(
   sessionAncestryCache.delete(projectDir);
   clearSessionProcessTable();
   if (validSessionId(sessionId) === null) return;
-  const deadline = Date.now() + SESSION_ANCESTRY_BUDGET_MS;
+  const deadline = Date.now() + sessionAncestryBudgetMs();
   const windows = sessionProcessPlatform() === "win32";
   const readIdentity = processIdentityReader(deadline);
   let childIdentity: ProcessIdentity | null = null;
@@ -7126,7 +7131,7 @@ export function resolveSessionIdFromAncestry(projectDir: string): string | null 
 // A valid payload always carries the private source marker, so the selection
 // chokepoint lets payload identity win without weakening bare env refusal. It
 // used to be set only when this process's ancestry walk named a different
-// session, but that walk fails closed within its 50 ms budget on a loaded host:
+// session, but that walk fails closed within its budget on a loaded host:
 // the child then saw an unmarked override, its own walk could find the other
 // session, and it refused. enterHookWorkflow and the Codex adapter already mark
 // payload identity without a walk.
@@ -7148,7 +7153,7 @@ export function hookChildEnv(
 
 function resolveSessionIdFromAncestryUncached(projectDir: string): string | null {
   if (!existsSync(sessionPidMapDir(projectDir))) return null;
-  const deadline = Date.now() + SESSION_ANCESTRY_BUDGET_MS;
+  const deadline = Date.now() + sessionAncestryBudgetMs();
   const windows = sessionProcessPlatform() === "win32";
   let childIdentity = windows ? windowsSessionProcessIdentity(process.pid, deadline) : null;
   if (windows && (!childIdentity || childIdentity.ppid !== process.ppid)) return null;
@@ -12756,6 +12761,17 @@ export function isConstructionSwarmEnabled(stateContent: string | null): boolean
 
 // An approved skeleton Unit was deliberately built before a stage-major swarm.
 // Its per-Unit source binding survives unrelated Units changing the workspace.
+// A Unit the person skipped every code-writing step for (UNIT_SKIPPED in that
+// step's current attempt) has nothing a checkpoint could verify, so it owes
+// none: the walk goes on to the next Unit and nothing waits on its approval,
+// as when the plan does not run Code Generation at all.
+export function unitSkippedItsCode(projectDir: string, stateContent: string, unit: string): boolean {
+  const code = unitMajorConstructionStageSlugs(getField(stateContent, "Scope") ?? "", stateContent, true)
+    .filter((slug) => findStageBySlug(slug)?.workspace_requires === true);
+  return code.length > 0 &&
+    code.every((slug) => unitSkippedUnits(projectDir, slug, undefined, stateContent).has(unit));
+}
+
 export function approvedConstructionUnits(
   projectDir: string,
   stateContent: string,
@@ -12777,6 +12793,11 @@ export function approvedConstructionUnits(
   if (dag.state !== "ok") return approved;
   const skeleton = constructionSkeletonOn(stateContent) ? dag.batches.flat()[0] : null;
   for (const unit of dag.units) {
+    // It owes no checkpoint, so it stands where an approved one does.
+    if (unitSkippedItsCode(projectDir, stateContent, unit)) {
+      approved.add(unit);
+      continue;
+    }
     const kind = unit === skeleton
       ? "skeleton"
       : "unit";
@@ -27566,6 +27587,87 @@ export interface HookLiveness {
   neverFired: boolean;
 }
 
+// Every readable `<hook>.last` in one hooks-health folder.
+function readHeartbeats(dir: string): { entries: string[]; newest: HookHeartbeatStamp | null; fired: boolean } {
+  const entries: string[] = [];
+  let newest: HookHeartbeatStamp | null = null;
+  let fired = false;
+  if (!existsSync(dir)) return { entries, newest, fired };
+  try {
+    const files = readdirSync(dir).filter((f) => f.endsWith(".last"));
+    if (files.length > 0) fired = true;
+    for (const f of files) {
+      try {
+        const ts = readFileSync(join(dir, f), "utf-8").trim();
+        const entry = `${f.replace(".last", "")} ${ts}`;
+        entries.push(entry);
+        const timestampMs = Date.parse(ts);
+        if (Number.isFinite(timestampMs) && (newest === null || timestampMs > newest.timestampMs)) {
+          newest = { timestampMs, timestampRaw: ts };
+        }
+      } catch {
+        // skip unreadable
+      }
+    }
+  } catch {
+    // skip unreadable dir
+  }
+  return { entries, newest, fired };
+}
+
+// The newest beat of the turn that created a record: in a space's pre-workflow
+// folder or in another record, of any space (a chained `space switch` beats in
+// the space it leaves), from the slack before the record's first event up to
+// that event. Null when the record is the space folder itself, has no event, or
+// no such beat exists.
+function creationHeartbeat(
+  projectDir: string,
+  workflow: { intent?: string; space?: string },
+  events: readonly AuditShardEvent[],
+): { stamp: HookHeartbeatStamp; entry: string } | null {
+  let first: number | null = null;
+  for (const event of events) {
+    const timestampMs = Date.parse(event.timestamp);
+    if (Number.isFinite(timestampMs) && (first === null || timestampMs < first)) first = timestampMs;
+  }
+  if (first === null) return null;
+  try {
+    const record = resolvePath(docsRoot(projectDir, workflow.intent, workflow.space));
+    if (record === resolvePath(intentsDir(projectDir, workflow.space))) return null;
+    const dirs: string[] = [];
+    for (const { name } of listSpaces(projectDir)) {
+      const intents = resolvePath(intentsDir(projectDir, name));
+      try {
+        const entries = readdirSync(intents, { withFileTypes: true });
+        dirs.push(join(engineDirFor(intents), "hooks-health"));
+        for (const entry of entries) {
+          if (!entry.isDirectory() || entry.name === ENGINE_DIR) continue;
+          const root = join(intents, entry.name);
+          if (resolvePath(root) === record) continue;
+          dirs.push(engineReadDirFor(root, join(engineDirFor(root), "hooks-health"), LEGACY_HOOKS_HEALTH_DIR));
+        }
+      } catch {
+        // A space with no intents folder, or an unreadable one, has no beat.
+      }
+    }
+    let found: { stamp: HookHeartbeatStamp; entry: string } | null = null;
+    for (const dir of dirs) {
+      const beats = readHeartbeats(dir);
+      for (const entry of beats.entries) {
+        const raw = entry.slice(entry.indexOf(" ") + 1);
+        const timestampMs = Date.parse(raw);
+        // Audit timestamps are to the second; a beat in that second is before it.
+        if (!Number.isFinite(timestampMs) || timestampMs < first - HOOK_HEARTBEAT_STALE_SLACK_MS || timestampMs >= first + 1000) continue;
+        if (found === null || timestampMs > found.stamp.timestampMs) found = { stamp: { timestampMs, timestampRaw: raw }, entry };
+      }
+    }
+    return found;
+  } catch {
+    // An unreadable space proves nothing either way.
+    return null;
+  }
+}
+
 // The one comparison behind the doctor's "Hooks last fired ... but the workflow
 // last advanced ..." row and the Plan Approval decision's liveness refusal, so
 // the two cannot disagree about what "hooks are not firing" means.
@@ -27578,33 +27680,11 @@ export function hookLiveness(
 ): HookLiveness {
   const healthDir = hooksHealthReadDir(projectDir, workflow.intent, workflow.space);
   const recordEvents = events ?? readAuditShardEvents(projectDir, workflow.intent, workflow.space);
-  const heartbeatEntries: string[] = [];
-  let newestHeartbeat: HookHeartbeatStamp | null = null;
-  let hasHookFiredContent = false;
+  const own = readHeartbeats(healthDir);
+  const heartbeatEntries = own.entries;
+  let newestHeartbeat = own.newest;
+  let hasHookFiredContent = own.fired;
   const healthDirExists = existsSync(healthDir);
-  if (healthDirExists) {
-    try {
-      const files = readdirSync(healthDir).filter((f) => f.endsWith(".last"));
-      if (files.length > 0) hasHookFiredContent = true;
-      for (const f of files) {
-        try {
-          const ts = readFileSync(join(healthDir, f), "utf-8").trim();
-          heartbeatEntries.push(`${f.replace(".last", "")} ${ts}`);
-          const timestampMs = Date.parse(ts);
-          if (
-            Number.isFinite(timestampMs) &&
-            (newestHeartbeat === null || timestampMs > newestHeartbeat.timestampMs)
-          ) {
-            newestHeartbeat = { timestampMs, timestampRaw: ts };
-          }
-        } catch {
-          // skip unreadable
-        }
-      }
-    } catch {
-      // skip unreadable dir
-    }
-  }
   let newestStageOrGateEvent: HookHeartbeatStamp | null = null;
   for (const event of recordEvents) {
     if (!event.event.startsWith("STAGE_") && !event.event.startsWith("GATE_")) continue;
@@ -27614,6 +27694,25 @@ export function hookLiveness(
       (newestStageOrGateEvent === null || timestampMs > newestStageOrGateEvent.timestampMs)
     ) {
       newestStageOrGateEvent = { timestampMs, timestampRaw: event.timestamp };
+    }
+  }
+  // The turn that created this record beat before the record existed: in a
+  // space's pre-workflow folder, or in the record the chat was on (#2263). A
+  // record with no beat of its own counts the newest such beat from the slack
+  // before its first event up to that event, and only while both its newest
+  // stage or gate event and now are within the slack of it, as `stale` reads a
+  // beat: past that, this record's own hooks should have beaten (a record
+  // parked at a gate writes no stage event, so the clock bounds it too).
+  if (!hasHookFiredContent && newestStageOrGateEvent !== null) {
+    const created = creationHeartbeat(projectDir, workflow, recordEvents);
+    if (
+      created !== null &&
+      newestStageOrGateEvent.timestampMs - created.stamp.timestampMs <= HOOK_HEARTBEAT_STALE_SLACK_MS &&
+      Date.now() - created.stamp.timestampMs <= HOOK_HEARTBEAT_STALE_SLACK_MS
+    ) {
+      hasHookFiredContent = true;
+      newestHeartbeat = created.stamp;
+      heartbeatEntries.push(created.entry);
     }
   }
   return {

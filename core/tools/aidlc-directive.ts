@@ -81,6 +81,17 @@ export const VALID_PROTOCOL_MODULES = [
   "construction",
   "swarm",
   "learnings",
+  // The Construction and ensemble branches a step can take, each named only
+  // on the steps that take it: a checkpoint, the Build-and-Test loop-back, a
+  // wave, and dispatched support agents.
+  "checkpoint",
+  "loopback",
+  "wave",
+  "collaborators",
+  // The review's per-Unit rules, and its repair loop, re-dispatch context and
+  // stale-receipt recovery, each named on the reviews that need them.
+  "reviewer-unit",
+  "reviewer-repair",
 ] as const;
 export type ProtocolModule = (typeof VALID_PROTOCOL_MODULES)[number];
 
@@ -1462,7 +1473,8 @@ export function withAgentNotes<T extends object>(
   }
   if (d.kind === "run-stage" && typeof d.stage_file === "string") {
     const modules = Array.isArray(d.protocol_modules)
-      ? d.protocol_modules.filter((module): module is string => typeof module === "string" && /^[a-z]+$/.test(module))
+      ? d.protocol_modules.filter((module): module is string =>
+        typeof module === "string" && (VALID_PROTOCOL_MODULES as readonly string[]).includes(module))
       : [];
     const note = protocolNote(d.stage_file, modules);
     if (note !== null) notes.protocol_note = note;
