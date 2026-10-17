@@ -339,6 +339,32 @@ For unconditional consumes, **omit the field entirely**. There is no
 `always` value — an unconditional consume simply has no `conditional_on`
 key.
 
+### `consumes[].cited`
+
+An optional boolean on a consume: `cited: true` says the stage's deliverables
+cite that input whenever it exists. The `upstream-coverage` check asks the
+deliverables to cite every required consume that exists; it leaves an optional
+one (`required: false`) unchecked, because an optional input may not have
+informed the output, unless the consume is marked `cited: true`. Requirements
+Analysis marks `intent-statement` and `scope-document`: both are optional
+there, because scopes without Ideation produce neither, and when they exist the
+requirements build on them.
+
+The compile lists the marked consumes as the stage's `cites` in
+`stage-graph.json` and keeps the compiled `consumes` entries as they were, so
+marking or unmarking one does not change the record of a stage that already
+finished. The flag sits on the consume, not in a top-level list, because a
+project on 2.8.0 to 2.11.0 refreshes to a newer release with its own tool,
+which accepts a key inside a consume and refuses a top-level key it does not
+know.
+
+```yaml
+consumes:
+  - artifact: intent-statement
+    required: false
+    cited: true
+```
+
 ### `optional_produces`
 
 A plain kebab-case string list, parallel to `produces:`. It names artifacts
@@ -625,7 +651,7 @@ The fixed order means a stage's sensor bindings and learning-loop pointer
 always have a place of their own. See [Sensor
 System](07-sensor-system.md) for the `## Sensors` binding semantics and
 the pull-import model. Shared sensor behavior is defined once in
-`stage-protocol.md` section 14, while `stage-protocol-learnings.md` section 13 defines the diary and ritual only when `directive.protocol_modules` lists `learnings`; otherwise skip both.
+`stage-protocol-sensors.md`, while `stage-protocol-learnings.md` section 13 defines the diary and ritual only when `directive.protocol_modules` lists `learnings`; otherwise skip both.
 The `## Sensors` and `## Learn` headings are checked by
 `t87-stage-compartment-headers` across all 33 stages; `## Steps` is in every
 stage but has no test of its own.

@@ -10,10 +10,9 @@
 // per-intent record dir + workspace tree, so this is a PROCESS boundary
 // exercised by spawning the real dist tool (spawnSync(BUN, [STATE, ...])).
 //
-// V2 PATH NOTE: the workspace refactor (#429) removed the flat aidlc-docs/
-// layout. A stage's produces[] artifacts now live under the ACTIVE intent's
-// per-intent record dir (aidlc/spaces/<space>/intents/<slug>-<id8>/<phase>/
-// <stage>/), per-unit Construction artifacts under that record's
+// A stage's produces[] artifacts live under the ACTIVE intent's per-intent
+// record dir (aidlc/spaces/<space>/intents/<YYMMDD>-<slug>/<phase>/<stage>/),
+// per-unit Construction artifacts under that record's
 // construction/<unit>/<stage>/, and codekb stages (reverse-engineering) under
 // the space-level aidlc/spaces/<space>/codekb/<repo>/. This test seeds those
 // live seams via seededRecordDir, NOT a flat aidlc-docs/ tree.
@@ -33,10 +32,11 @@
 //        must not pass).
 //   Bypass: AIDLC_SKIP_ARTIFACT_GUARD=1 (env).
 //
-// CRITICAL test-harness note: run-tests.ts sets AIDLC_SKIP_ARTIFACT_GUARD=1 for
-// the whole suite (most state tests rubber-stamp bare fixtures by design). This
-// test re-enables enforcement by DELETING that var from the spawned tool's env
-// - otherwise it would be testing the bypass, not the guard.
+// CRITICAL test-harness note: the test runner (runner-profile.ts
+// FIXTURE_GUARD_ENV) sets AIDLC_SKIP_ARTIFACT_GUARD=1 for the whole suite (most
+// state tests rubber-stamp bare fixtures by design). This test re-enables
+// enforcement by DELETING that var from the spawned tool's env - otherwise it
+// would be testing the bypass, not the guard.
 
 import { NATIVE_FIXTURE_SETUP_TIMEOUT_MS } from "../harness/test-budget.ts";
 import {
@@ -74,6 +74,7 @@ import {
 } from "../harness/fixtures.ts";
 import { appendAuditEntry } from "../../dist/claude/.claude/tools/aidlc-audit.ts";
 import {
+  guardRecoveryAskFromRefusalText,
   pipelineAttemptStartedAt,
   readSummaryAuthorization,
   SUMMARY_CONFIRMATION_HASH_SCOPE,
@@ -89,6 +90,11 @@ const LOG = join(AIDLC_SRC, "tools", "aidlc-log.ts");
 const ORCHESTRATE = join(AIDLC_SRC, "tools", "aidlc-orchestrate.ts");
 const MID_IDEATION = "state-mid-ideation.md"; // Current Stage: feasibility
 let handoffClock = 0;
+
+// The guard-recovery ask a refusal carries on the last line of its sentence.
+function refusalAsk(out: string) {
+  return guardRecoveryAskFromRefusalText((JSON.parse(out) as { error: string }).error);
+}
 
 function ensurePipelineAttemptStarted(proj: string): void {
   if (pipelineAttemptStartedAt(proj, "reverse-engineering")) return;
@@ -244,7 +250,6 @@ function guarded(
   return { rc: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 }
 
-// Same but with the bypass var set - proves the escape hatch.
 function bypassed(proj: string, args: string[]): { rc: number; out: string } {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -624,7 +629,7 @@ describe("t185: stage-completion artifact guard (#366)", () => {
   // --- Layer 1: produces-existence, ideation stage (feasibility) -------------
 
   test("approve REFUSES when the stage produced no artifacts", () => {
-    const slug = field(proj, "Current Stage"); // feasibility
+    const slug = field(proj, "Current Stage");
     bypassed(proj, ["checkbox", `${slug}=in-progress`]);
     bypassed(proj, ["gate-start", slug]);
     const r = guarded(proj, ["approve", slug, "--user-input", "ok"]);
@@ -632,7 +637,6 @@ describe("t185: stage-completion artifact guard (#366)", () => {
     expect((JSON.parse(r.out) as { error: string }).error).toContain(
       'Cannot complete "feasibility": none of its declared artifacts exist',
     );
-    // State untouched: the stage is NOT marked completed.
     expect(field(proj, "Current Stage")).toBe(slug);
   });
 
@@ -640,12 +644,49 @@ describe("t185: stage-completion artifact guard (#366)", () => {
     const slug = field(proj, "Current Stage");
     const r = guarded(proj, ["gate-start", slug]);
     expect(r.rc).not.toBe(0);
-    expect((JSON.parse(r.out) as { error: string }).error).toContain(
+    const said = (JSON.parse(r.out) as { error: string }).error;
+    expect(said).toContain(
       'Cannot present "feasibility" for approval: none of its declared artifacts exist',
     );
+    expect(said).toContain("then run the same report again");
+    // Writing the outputs is the agent's own step, the refusal's own sentence;
+    // Feasibility has no reviewer, so a review request is no way on.
+    const ask = refusalAsk(r.out);
+    expect(ask?.agent_work, r.out).toBe(true);
+    expect(ask?.remedies.map((remedy) => [remedy.op, remedy.interaction])).toEqual([
+      ["produce-stage-output", "external-work"],
+    ]);
+    expect(ask?.remedies[0]?.action).toBe(said.split("\n")[0]);
     expect(readFileSync(seededStateFile(proj), "utf-8")).toContain(
       `- [-] ${slug}`,
     );
+  });
+
+  // The reporter's path: `report` hands back only the ask, so the step the
+  // agent takes is the refusal's own sentence on its one way on.
+  test("report on a stage with no outputs hands the agent writing them, in the refusal's own words", () => {
+    const slug = field(proj, "Current Stage");
+    bypassed(proj, ["checkbox", `${slug}=in-progress`]);
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.AIDLC_SKIP_ARTIFACT_GUARD;
+    const r = spawnSync(BUN, [ORCHESTRATE, "report", "--stage", slug, "--result", "awaiting-approval", "--project-dir", proj], {
+      encoding: "utf-8",
+      env,
+    });
+    const step = JSON.parse(r.stdout) as {
+      kind?: string;
+      agent_work?: boolean;
+      reason_codes?: string[];
+      remedies?: { op: string; action: string; interaction?: string }[];
+    };
+    expect(step.kind, r.stdout).toBe("ask");
+    expect(step.agent_work, r.stdout).toBe(true);
+    expect(step.reason_codes).toEqual(["REQUIRED_ARTIFACTS_MISSING"]);
+    expect(step.remedies?.map((remedy) => [remedy.op, remedy.interaction])).toEqual([
+      ["produce-stage-output", "external-work"],
+    ]);
+    expect(step.remedies?.[0]?.action).toContain('Cannot present "feasibility" for approval: none of its declared artifacts exist');
+    expect(step.remedies?.[0]?.action).toContain("then run the same report again");
   });
 
   test("revise REFUSES before [?] when revised artifacts are absent", () => {
@@ -704,13 +745,12 @@ describe("t185: stage-completion artifact guard (#366)", () => {
   });
 
   test("approve PASSES once a declared produces[] artifact exists", () => {
-    const slug = field(proj, "Current Stage"); // feasibility, phase ideation
+    const slug = field(proj, "Current Stage");
     guarded(proj, ["checkbox", `${slug}=in-progress`]);
     writeRecordDoc(proj, `ideation/${slug}/feasibility-assessment.md`);
     guarded(proj, ["gate-start", slug]);
     const r = guarded(proj, ["approve", slug, "--user-input", "ok"]);
     expect(r.rc).toBe(0);
-    // Auto-advanced off feasibility.
     expect(field(proj, "Current Stage")).not.toBe(slug);
   });
 
@@ -1878,7 +1918,7 @@ X. Other (please specify)
 
     test("PASSES code-generation once real source exists outside aidlc/", () => {
       stageCodeGenDocsOnly();
-      writeWorkspaceFile(proj, "src/auth/login.ts"); // outside aidlc/ + harness
+      writeWorkspaceFile(proj, "src/auth/login.ts");
       reviewCodeGen(proj, UNIT);
       bypassed(proj, ["gate-start", "code-generation"]);
       const r = guarded(proj, ["approve", "code-generation", "--user-input", "ok"], {
@@ -1911,11 +1951,10 @@ X. Other (please specify)
 
   // --- Layer 1 (codekb placement): reverse-engineering -----------------------
   //
-  // V2-specific: codekb stages (reverse-engineering) write their produces[] to
+  // Codekb stages (reverse-engineering) write their produces[] to
   // the space-level aidlc/spaces/<space>/codekb/<repo>/ dir, NOT a per-intent
   // record dir. The guard must resolve THAT placement, else it false-refuses a
-  // real reverse-engineering approval. (The old flat-path design had no codekb
-  // concept; this case did not exist in the reference t154.)
+  // real reverse-engineering approval.
   describe("codekb placement (reverse-engineering)", () => {
     test("REFUSES reverse-engineering with no codekb artifacts", () => {
       guarded(proj, ["set", "Current Stage=reverse-engineering"]);
@@ -2043,12 +2082,12 @@ X. Other (please specify)
       );
     }
 
-    // BROWNFIELD bug closed: a git repo whose src/ was committed in a PRIOR
+    // BROWNFIELD: a git repo whose src/ was committed in a PRIOR
     // commit, with a clean tree and only doc changes this session, must REFUSE -
     // the bare FS check would have wrongly passed on the pre-existing src/.
     test("REFUSES when src/ is pre-existing (committed earlier) and no new code this session", () => {
       initGitRepo();
-      writeWorkspaceFile(proj, "src/legacy/old.ts"); // brownfield baseline
+      writeWorkspaceFile(proj, "src/legacy/old.ts");
       git(["add", "-A"]);
       git(["commit", "-q", "-m", "baseline brownfield code"]);
       // This session: only the code-gen planning docs (no new code), then commit
@@ -2079,8 +2118,13 @@ X. Other (please specify)
       const refused = approveCodeGen();
       expect(refused.rc).not.toBe(0);
       expect(refused.out).toContain("a source change not committed yet counts, as does code in the last commit");
-      expect(refused.out).toContain("choose Request Changes and say what is missing");
+      expect(refused.out).toContain("then run the same report again");
+      // The way on is the agent's own step: it carries no question for the person.
+      expect(refused.out).not.toContain("choose Request Changes");
       expect(refused.out).not.toContain("--bypass");
+      const ask = refusalAsk(refused.out);
+      expect(ask?.agent_work, refused.out).toBe(true);
+      expect(ask?.remedies.map((remedy) => remedy.op)).toEqual(["produce-stage-output"]);
       // The step it names: new source, reviewed again as any change is, and
       // the same approve goes through.
       writeFileSync(join(proj, "src", "auth", "login.ts"), "export const login = 2;\n");
@@ -2089,12 +2133,11 @@ X. Other (please specify)
       expect(approved.rc, approved.out).toBe(0);
     }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
-    // Uncommitted/untracked new source this session -> PASS.
     test("PASSES with an uncommitted new source file this session", () => {
       initGitRepo();
       git(["commit", "-q", "--allow-empty", "-m", "init"]);
       stageCodeGenDocsOnly();
-      writeWorkspaceFile(proj, "src/auth/login.ts"); // untracked, uncommitted
+      writeWorkspaceFile(proj, "src/auth/login.ts");
       const r = approveCodeGen();
       expect(r.rc).toBe(0);
     }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
@@ -2107,7 +2150,7 @@ X. Other (please specify)
       git(["commit", "-q", "--allow-empty", "-m", "init"]);
       stageCodeGenDocsOnly();
       writeWorkspaceFile(proj, "src/auth/login.ts");
-      git(["add", "-A"]); // stage BOTH the docs and the new code
+      git(["add", "-A"]);
       git(["commit", "-q", "-m", "code-generation output"]);
       const r = approveCodeGen();
       expect(r.rc, r.out).toBe(0);
@@ -2118,15 +2161,15 @@ X. Other (please specify)
     // so `git diff HEAD~1 HEAD` errors and gitHasSourceWork cannot inspect the
     // last commit. It must return null (NOT false) so workspaceHasWork falls back
     // to the filesystem probe, which sees the committed src/ - otherwise the
-    // code-generation approve is false-refused (gitHasSourceWork header contract;
-    // @leandrodamascena's PR #443 review). Distinct from the case above: that one
-    // makes a separate `--allow-empty init` commit first (HEAD~1 resolves); this
-    // one has exactly ONE commit (HEAD~1 misses).
+    // code-generation approve is false-refused (gitHasSourceWork header contract).
+    // Distinct from the case above: that one makes a separate `--allow-empty init`
+    // commit first (HEAD~1 resolves); this one has exactly ONE commit (HEAD~1
+    // misses).
     test("PASSES on a single-commit clean tree whose only commit contains the source", () => {
       initGitRepo();
       stageCodeGenDocsOnly();
       writeWorkspaceFile(proj, "src/auth/login.ts");
-      git(["add", "-A"]); // stage docs + the new code into the FIRST and ONLY commit
+      git(["add", "-A"]);
       git(["commit", "-q", "-m", "first commit: code-generation output"]);
       const r = approveCodeGen();
       expect(r.rc, r.out).toBe(0);
@@ -2322,9 +2365,9 @@ X. Other (please specify)
 
   // --- Settled-swarm exemption (code-generation under autonomous swarm) ------
   //
-  // A swarm's per-unit artifacts and source live in Bolt WORKTREES; the main
-  // checkout has neither, so both guard layers would refuse the settle
-  // approval the engine just presented. The referee's per-unit convergence
+  // A swarm's per-unit artifacts and source originate in Bolt WORKTREES;
+  // reviewed records land in the main checkout, but file presence cannot replace
+  // the complete-set convergence evidence. The referee's per-unit convergence
   // ledger is the evidence instead: with a valid DAG whose EVERY unit has a
   // current-run SWARM_UNIT_CONVERGED row, the guard exempts. Any unconverged
   // unit keeps the guard strict (fails closed).
@@ -2343,7 +2386,6 @@ X. Other (please specify)
           "$1\n- **Construction Autonomy Mode**: autonomous",
         ),
       );
-      // A valid two-unit DAG in the compiled runtime graph.
       writeFileSync(
         join(seededRecordDir(proj), "runtime-graph.json"),
         `${JSON.stringify({
@@ -2379,10 +2421,10 @@ X. Other (please specify)
     }
 
     test("PASSES with zero on-disk artifacts once every DAG unit converged", () => {
-      // The migrated review flow writes each converged unit's reviewed plan
+      // The review flow writes each converged unit's reviewed plan
       // into the record dir, but the exemption is still granted from the
       // convergence ledger before any produces walk.
-      seedSwarm(UNITS); // all converged
+      seedSwarm(UNITS);
       bypassed(proj, ["gate-start", "code-generation"]);
       const r = guarded(
         proj,
@@ -2393,7 +2435,7 @@ X. Other (please specify)
     });
 
     test("REFUSES while any DAG unit is unconverged (fails closed)", () => {
-      seedSwarm([UNITS[0]]); // one of two converged
+      seedSwarm([UNITS[0]]);
       gateSetupBypassed(proj, ["gate-start", "code-generation"]);
       const r = guarded(proj, ["approve", "code-generation", "--user-input", "ok"]);
       expect(r.rc).not.toBe(0);
