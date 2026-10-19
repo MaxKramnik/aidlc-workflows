@@ -76,7 +76,7 @@ diagnostic and lifecycle routes.
 | `/aidlc plugin select [names]` | Show or set the enabled plugin list for this install |
 | `/aidlc plugin list` | List installed plugins and enabled state |
 | `/aidlc plugin sync` | Compose installed plugin roots into the current install |
-| `/aidlc plugin validate [path]` | Validate an authored plugin (`--json` for structured findings) |
+| `/aidlc plugin validate [path]` | Validate an authored plugin (`--with <base-root>` checks a base plugin's agents; `--json` for structured findings) |
 | `/aidlc plugin build <harness> [outDir]` | Build a host plugin projection (`--plugin-root <path>` selects the source) |
 | `/aidlc --version` | Print the framework version |
 | `/aidlc --help` | Display usage information |
@@ -2692,7 +2692,7 @@ it, and reverting an edit restores the original fingerprint.
 
 ### `aidlc engine workspace reclassify` - new project or existing code
 
-`aidlc engine workspace reclassify --project-type <greenfield|brownfield> [--intent <slug>] [--space <name>] [--then-rerun]` is the command behind a mid-workflow `/aidlc --project-type` and the answers to the "this folder now has code" question. It scans the folder again and records the type as the person's in one locked write, audited first as `WORKSPACE_RECLASSIFIED`. It never moves the workflow itself: when it puts Reverse Engineering back behind the current stage, the next `next` names the redo jump that runs it. On finished or archived work it records the type and leaves the plan as it is. Its reply is a `done` directive that continues the workflow (with `--then-rerun`, used when the same request asked for more, a `print` that runs the same `next` again). What you hear is said with the next step the agent speaks from: the new type and what was found, what comes next, any stage that ran before the code was there and how to redo it, and, when the type changes, how to undo it.
+`aidlc engine workspace reclassify --project-type <greenfield|brownfield> [--intent <slug>] [--space <name>] [--person-words <their words> | --person-words-file <file>] [--then-rerun]` is the command behind a mid-workflow `/aidlc --project-type` and the answers to the "this folder now has code" question. It scans the folder again and records the type as the person's in one locked write, audited first as `WORKSPACE_RECLASSIFIED`. When the type was said with the words of a request, `next` puts those words in the work's answer text file and the step it prints names it with `--person-words-file`, so no shell reads them on the way; said on its own, the step names `--person-words` for the agent to fill with the person's words that asked for it. The audit row records them as `Person Words`. It never moves the workflow itself: when it puts Reverse Engineering back behind the current stage, the next `next` names the redo jump that runs it. On finished or archived work it records the type and leaves the plan as it is. Its reply is a `done` directive that continues the workflow (with `--then-rerun`, used when the same request asked for more, a `print` that runs the same `next` again). What you hear is said with the next step the agent speaks from: the new type and what was found, what comes next, any stage that ran before the code was there and how to redo it, and, when the type changes, how to undo it.
 
 ### `aidlc-workspace-sync` - clone and reconcile the declared repo set
 
@@ -2765,7 +2765,7 @@ bun .claude/tools/aidlc-utility.ts select-plugins test-pro
 bun .claude/tools/aidlc-utility.ts select-plugins aidlc,test-pro
 ```
 
-The command validates names, writes `.claude/tools/data/harness.json`, strips a newly disabled plugin's merged contributions from core stage source (structural adds via the compose-written sidecar, spliced prose via its sentinel markers; re-enabling restores them on the next session start), recompiles the full graph with disabled nodes marked `enabled:false`, prunes/regenerates stage and scope runners, and refreshes the generated scope and stage tables (`tables.md`, beside the orchestrator skill) in one transaction. `aidlc` is core; omitting it disables core surfaces except the always-on Initialization stages. A change that would strand an active workflow (its scope, or a pending EXECUTE stage in its plan, owned by a plugin the new selection disables) is refused with each dependency named - complete or archive the workflow first (a parked workflow still needs its plugin when it resumes), or keep the plugin enabled. Leaving a base plugin out while keeping a plugin built on it pauses that plugin: the list is written as typed, one line says so once with the command that turns the plugin off as well, nothing the plugin adds runs while its base is off, `plugin list` shows it as `paused`, and turning the base back on brings it back at the next session start.
+The command validates names, writes `.claude/tools/data/harness.json`, strips a newly disabled plugin's merged contributions from core stage source (structural adds via the compose-written sidecar, spliced prose via its sentinel markers; re-enabling restores them on the next session start, or on Kiro CLI and opencode when you run `aidlc engine plugin sync --plugin-root <folder>` with the plugin's folder), recompiles the full graph with disabled nodes marked `enabled:false`, prunes/regenerates stage and scope runners, and refreshes the generated scope and stage tables (`tables.md`, beside the orchestrator skill) in one transaction. `aidlc` is core; omitting it disables core surfaces except the always-on Initialization stages. A change that would strand an active workflow (its scope, or a pending EXECUTE stage in its plan, owned by a plugin the new selection disables) is refused with each dependency named - complete or archive the workflow first (a parked workflow still needs its plugin when it resumes), or keep the plugin enabled. Leaving a base plugin out while keeping a plugin built on it pauses that plugin: the list is written as typed, one line says so once with the command that turns the plugin off as well, nothing the plugin adds runs while its base is off, `plugin list` shows it as `paused`, and turning the base back on brings it back at the next session start.
 
 `/aidlc plugin sync` (`aidlc engine plugin sync`) runs installed plugin compose
 hooks from the host's plugin inventory, and prints `plugin sync complete: <n>
@@ -2776,11 +2776,16 @@ compose on its base (not installed, outside the plugin's version range, built
 on another plugin, or two bases named) is held: sync says why once, in one line
 after the complete line, composes every other plugin and exits 0, and `--json`
 lists it in `data.held`. `aidlc engine plugin list` and doctor keep the line
-until a sync composes it; a held plugin composed before stays as it was. On a
+until a sync composes it; a held plugin composed before stays as it was. A plugin installed twice (its old `aidlc-<name>` copy beside the rebuilt one) composes from the rebuilt one, and sync prints one line naming the old copy's remove command each time it runs, listed in `--json` as `data.superseded`. On a
 host whose session-start hook names only its own plugin, the hook composes that
 plugin's installed base first. An inventory with an
 invalid entry, or a plugin root with no `hooks/compose.ts`, refuses the whole
-sync and names what is wrong, so nothing is half composed. Where the host keeps
+sync and names what is wrong, so nothing is half composed. `--plugin-root <dir>`
+names the installed plugin to compose, as `AIDLC_PLUGIN_ROOT` does; Kiro IDE's
+folder-dropped hook passes the plugin's own folder, `./.kiro/aidlc-plugins/<name>`.
+`--harness-dir <dir>`
+names the harness folder to compose into, as `AIDLC_HARNESS_DIR` does, for a
+project with more than one harness installed. Where the host keeps
 no plugin inventory to read, it says so and stops; in a native Claude Code
 project before Claude Code has a plugin registry
 (`~/.claude/plugins/installed_plugins.json`):
@@ -2801,6 +2806,9 @@ explicit sync.
 authoring tools through the top-level CLI. Validation defaults to the current
 directory. Build also defaults its plugin root to the current directory; pass
 `--plugin-root <path>` when invoking it elsewhere. Both accept `--json`.
+Validation of a plugin built on a base takes `--with <base-root>`, your own
+checkout of that base, so a stage led by the base's agent is checked instead of
+reported as not checked.
 
 ### `aidlc-utility recompose` - in-flight plan flips
 
