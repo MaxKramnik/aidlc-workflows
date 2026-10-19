@@ -1390,9 +1390,10 @@ the message), rewrites the `Guard Policy` line in `aidlc-state.md` as
 `<value> (set by you)` (or `(set by a command)` when nothing on record shows the
 person asked) and add a `GUARD_POLICY_SET` row to the audit batch.
 Any write of the policy line removes the retired `Change Control` line, retaining only `Guard Policy`.
-If both lines exist with different policy words, strict applies and status shows
-`strict (from conflicting state lines)` unless memory holds strict; `next` carries
-the [conflict notice](13-customization.md#where-the-value-lives) until you choose.
+If both lines exist with different policy words, status shows
+`strict (from conflicting state lines)` until the next `next` keeps one of them
+(see [where the value lives](13-customization.md#where-the-value-lives)), unless
+memory holds strict.
 If both agree, the `Guard Policy` line is used and the next policy write removes
 the retired one. A record carrying only a retired relaxed or off line is
 renamed at your next message: the value is kept and written as `Guard Policy`,
@@ -1526,6 +1527,12 @@ Kiro says agent "aidlc" needs upgrading for its 3.0 engine, the line is "Your
 answer didn't reach AI-DLC. Quit Kiro and start it again in this folder with:
 kiro-cli chat --agent-engine v2 --agent aidlc, then give it once more." The
 agent is told never to offer to turn a check off for them.
+
+A `log answer` for a question the agent logged after the person's reply is
+refused too, and the refusal says so to the agent. When the person's message is
+on record, it names that message (`--message <id>`), so they are not asked
+again; the line about an answer that didn't reach AI-DLC is said only if no
+message of theirs answers it.
 
 Only `AIDLC_SKIP_HUMAN_PRESENCE_GUARD=1` lowers human presence, set machine-wide
 or recorded with `aidlc config flags --bypass` (AI-DLC then says it is off).
@@ -2765,7 +2772,7 @@ bun .claude/tools/aidlc-utility.ts select-plugins test-pro
 bun .claude/tools/aidlc-utility.ts select-plugins aidlc,test-pro
 ```
 
-The command validates names, writes `.claude/tools/data/harness.json`, strips a newly disabled plugin's merged contributions from core stage source (structural adds via the compose-written sidecar, spliced prose via its sentinel markers; re-enabling restores them on the next session start, or on Kiro CLI and opencode when you run `aidlc engine plugin sync --plugin-root <folder>` with the plugin's folder), recompiles the full graph with disabled nodes marked `enabled:false`, prunes/regenerates stage and scope runners, and refreshes the generated scope and stage tables (`tables.md`, beside the orchestrator skill) in one transaction. `aidlc` is core; omitting it disables core surfaces except the always-on Initialization stages. A change that would strand an active workflow (its scope, or a pending EXECUTE stage in its plan, owned by a plugin the new selection disables) is refused with each dependency named - complete or archive the workflow first (a parked workflow still needs its plugin when it resumes), or keep the plugin enabled. Leaving a base plugin out while keeping a plugin built on it pauses that plugin: the list is written as typed, one line says so once with the command that turns the plugin off as well, nothing the plugin adds runs while its base is off, `plugin list` shows it as `paused`, and turning the base back on brings it back at the next session start.
+The command validates names, writes `.claude/tools/data/harness.json`, strips a newly disabled plugin's merged contributions from core stage source (structural adds via the compose-written sidecar, spliced prose via its sentinel markers; re-enabling restores them on the next session start, or on Kiro CLI and opencode when you run `aidlc engine plugin sync --plugin-root <folder>` with the plugin's folder), recompiles the full graph with disabled nodes marked `enabled:false`, prunes/regenerates stage and scope runners, and refreshes the generated scope and stage tables (`tables.md`, beside the orchestrator skill) in one transaction. `aidlc` is core; omitting it disables core surfaces except the always-on Initialization stages. A change that would strand an active workflow (its scope, or a pending EXECUTE stage in its plan, owned by a plugin the new selection disables) is refused with each dependency named - complete or archive the workflow first (a parked workflow still needs its plugin when it resumes), or keep the plugin enabled. Leaving a base plugin out while keeping a plugin built on it pauses that plugin: the list is written as typed, one line says so once with the command that turns the plugin off as well, nothing the plugin adds runs while its base is off, `plugin list` shows it as `paused`, and turning the base back on brings it back at the next session start (on Kiro CLI and opencode, when you run `aidlc engine plugin sync --plugin-root <folder>` with the plugin's folder); the select that turns the base on says which, once.
 
 `/aidlc plugin sync` (`aidlc engine plugin sync`) runs installed plugin compose
 hooks from the host's plugin inventory, and prints `plugin sync complete: <n>
@@ -2785,15 +2792,26 @@ names the installed plugin to compose, as `AIDLC_PLUGIN_ROOT` does; Kiro IDE's
 folder-dropped hook passes the plugin's own folder, `./.kiro/aidlc-plugins/<name>`.
 `--harness-dir <dir>`
 names the harness folder to compose into, as `AIDLC_HARNESS_DIR` does, for a
-project with more than one harness installed. Where the host keeps
-no plugin inventory to read, it says so and stops; in a native Claude Code
-project before Claude Code has a plugin registry
-(`~/.claude/plugins/installed_plugins.json`):
+project with more than one harness installed. Kiro CLI, Kiro IDE, Cursor,
+Copilot and opencode keep no list of the plugins installed, so a sync there
+with no plugin folder composes nothing and names the command for each plugin
+composed in the project:
 
 ```text
 $ aidlc engine plugin sync
-aidlc engine plugin: host inventory unavailable; run sync through an installed plugin's host hook
+aidlc engine plugin: Nothing synced: this tool keeps no list of your plugins, so name each one's folder: `aidlc engine plugin sync --plugin-root <test-pro's folder>`.
 ```
+
+Where another harness comes first in the project (a `.claude` folder beside
+`.kiro`, say), the native `aidlc` would compose into that one, so the command
+also names the harness: `aidlc engine plugin sync --harness-dir .kiro --plugin-root <test-pro's folder>`.
+
+Every line that sends you to sync there (this one, a sync refused over a file
+you changed, and doctor's composed-surface and uncompiled-stage fixes) names
+the same command, with the plugin's real folder when the line knows it. In a
+native Claude Code project before Claude Code has a plugin registry
+(`~/.claude/plugins/installed_plugins.json`) it says
+`host inventory unavailable; run sync through an installed plugin's host hook`.
 Re-run it after every engine reinstall or upgrade: copying a fresh
 `dist/<harness>/` restores the shipped graph and core stage sources, so
 previously composed plugin graph entries and contribution merges must be

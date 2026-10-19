@@ -259,7 +259,11 @@ selection less the paused plugins; the base comes from the plugin's composition
 stamp), which every runtime reader and doctor's selection-agreement check
 read; `pluginsSelected()` is the list as typed. `plugin list` shows the plugin
 as `paused: needs zeta, which is off` and doctor lists it as information. Turning
-the base back on brings the plugin back at the next session start. A pause that
+the base back on brings the plugin back at the next session start (on Kiro CLI
+and opencode, when the person runs `aidlc engine plugin sync --plugin-root
+<folder>`); the select or `config project --plugins` that turns it on says
+which, once (`resumedLine()` beside `pausedLine()` in `aidlc-lib.ts`, with the
+words from `nextCompose()`). A pause that
 would strand open work is refused like any turn-off, naming the plugin and the
 base. Through `aidlc config project --plugins`, a plugin turned off or paused
 loses its merged contributions the same way: every config refresh runs the same
@@ -344,9 +348,12 @@ Neither list, doctor, nor sync checks a remote plugin registry. The host remains
 responsible for published-version discovery.
 
 For source-tree installs, the `plugin-sync` utility verb (the compose hooks'
-fallback front) runs discovered plugin roots' `hooks/compose.ts` files and
-exits cleanly with
-`no installed plugins; nothing to sync` when no plugin roots are configured. If
+fallback front) runs discovered plugin roots' `hooks/compose.ts` files, from
+the environment or `--plugin-root <dir>`, and exits cleanly when no plugin
+roots are configured: with `no installed plugins; nothing to sync` on Claude
+Code and Codex, and elsewhere with the line `plugin sync` prints there, which
+names the command for each composed plugin (`noPluginListLine()` and
+`syncCommand()` in `aidlc-plugin.ts`). If
 roots are configured but none carries `hooks/compose.ts`, it exits 1 and names
 each root and reason; with a mixed set it warns for each skipped root, composes
 the valid roots, and exits 0.

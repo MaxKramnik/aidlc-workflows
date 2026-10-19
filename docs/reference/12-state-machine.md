@@ -275,9 +275,17 @@ marked complete without evidence of work on disk. A stage that declares
 intent's record dir or its per-unit Construction directories. A codekb stage
 is stricter: every registered repository directory must contain the full
 declared `produces[]` set; single/unrecorded intents use the one resolved
-codekb directory. `workspace_requires: true` also requires source-work evidence
-outside `aidlc/` and the harness dir, in the workspace or in one of the
-intent's recorded repos. A failure writes nothing. Optional outputs
+codekb directory. `workspace_requires: true` also looks for source-work evidence
+outside `aidlc/` and the harness dir: in the workspace, in the intent's recorded
+repos, in child repos and worktrees found when the check runs, in the linked
+worktrees of each of those, in checkouts the workspace's git does not track
+(those found when the check runs count only where the review can see their
+code change, so not in a harness folder or outside the project), and in the
+source changed since the stage attempt began. When it finds none,
+Guard Policy off lets the work carry on with one recorded line; otherwise the
+agent's own first report is refused and its second puts the approval question
+to the person with that line (`SOURCE_WORK_NOT_FOUND`), unless no approval
+would be the person's reply after the gate. A failure writes nothing else. Optional outputs
 do not participate. For `produces_kinds`, units whose kind prunes the required
 set to zero owe no artifact; any applicable unit remains strict. Bypass with
 `AIDLC_SKIP_ARTIFACT_GUARD=1`. The same switch also bypasses the review logger's
@@ -687,7 +695,7 @@ Session hooks check for the active intent's `aidlc-state.md` (under `aidlc/space
 
 ## Audit event taxonomy
 
-**119 events**, grouped below into 20 categories (the canonical `audit-format.md` registry splits the same 119 into 25 - the grouping is presentational, the event set is the invariant). Each event's permitted tool or hook emitters are listed below. `GUARD_POLICY_SET` has distinct mutation and effective-memory-observation paths; neither duplicates the other's emission. Events pre-registered for an upcoming release have an Emitter cell reading `Reserved (v0.4.0 PR N)`, `Reserved (v0.5.0 PR N)`, or `Reserved (v0.6.0 PR N)`, and a retired event name that is still read but never written reads `Reserved (retired name)`; both are skipped by the drift test's forward check. The drift test `tests/integration/t48-audit-event-emitters.test.ts` enforces forward/reverse/tertiary/pairing/MD-MD consistency between this chapter's tables and the code.
+**120 events**, grouped below into 20 categories (the canonical `audit-format.md` registry splits the same 120 into 25 - the grouping is presentational, the event set is the invariant). Each event's permitted tool or hook emitters are listed below. `GUARD_POLICY_SET` has distinct mutation and effective-memory-observation paths; neither duplicates the other's emission. Events pre-registered for an upcoming release have an Emitter cell reading `Reserved (v0.4.0 PR N)`, `Reserved (v0.5.0 PR N)`, or `Reserved (v0.6.0 PR N)`, and a retired event name that is still read but never written reads `Reserved (retired name)`; both are skipped by the drift test's forward check. The drift test `tests/integration/t48-audit-event-emitters.test.ts` enforces forward/reverse/tertiary/pairing/MD-MD consistency between this chapter's tables and the code.
 
 ### Workflow lifecycle
 
@@ -721,6 +729,7 @@ Session hooks check for the active intent's `aidlc-state.md` (under `aidlc/space
 | `STAGE_SKIPPED` | `tools/aidlc-state.ts`, `tools/aidlc-jump.ts`, `tools/aidlc-utility.ts` | Exactly one per `[S]` transition; the main-workflow report path routes onward atomically. A scope change that skips the current stage before it started, or a stage waiting for approval, writes `[S]` with `Skip Kind: scope-change`; the next `next` routes past a current one through `report --result skipped`, which adds no second row |
 | `STAGE_JUMPED` | `tools/aidlc-jump.ts` | Records the destination slug on `--stage`/`--phase` jump. Backward jumps also bind the concrete changed upstream artifact paths and the downstream artifact/review paths invalidated by the reset. It starts a new attempt (run floor, review and summary attempts, Unit checkpoint approvals, source baseline) for its `Target` and every stage after it in the stage graph, the stages it resets; a stage before the `Target` keeps its attempt, so a jump back to Code Generation keeps each Unit's Functional Design (`stageJumpReaches`). A row with no `Target` the graph knows reaches every stage. |
 | `STAGE_DEFINITION_CHANGED` | `tools/aidlc-orchestrate.ts` | A finished stage AI-DLC itself now does differently (an update, a plugin turned on, the team's own stage edit) while nothing of the person's work changed. Written once the next step was said (never by a rules part or a read-only probe); that step carries a `change_notices` line only when the stage now needs an input it did not need when it ran. `Validation Basis` is the stage's receipt for its new definition and stands in for its completion receipt from then on; `Details` is the line said, or that nothing was. |
+| `SOURCE_WORK_NOT_FOUND` | `tools/aidlc-state.ts` | Code Generation's source-work check (`workspace_requires`) found no new code where it looked; the row names where (`Looked In`) and what the check did (`Outcome`): `told the agent` (the agent's first report in this attempt refused), `put to the person` (the approval question went to them with the note) or `stood aside` (Guard Policy off). One row per outcome per attempt (`Run floor`); never written by the engine's read-only probes. |
 
 ### Gate decisions
 
@@ -962,11 +971,21 @@ policy words, `resolveGuardPolicy` returns `value: "strict"` and
 `conflict: { guardPolicy: <raw>, changeControl: <raw> }` holding both raw values.
 Status renders `strict (from conflicting state lines)`; memory-held strict still
 wins as before. If both words agree, the `Guard Policy` line is used and the next
-policy write removes the retired line. Until a conflict is resolved, `next`
-includes this notice in `change_notices`, substituting the raw values for `<a>`
-and `<b>` without changing the state file:
+policy write removes the retired line. `next` settles a conflict before it reads
+the state (`settleGuardPolicyConflict` in aidlc-guard-switch.ts, skipped on a
+read-only probe and under memory-held strict): it keeps the line whose value and
+source match the newest `GUARD_POLICY_SET` or `CHANGE_CONTROL_SET` row, else the
+one line labelled `set by you`, else the one equal to the scope's shipped default,
+else the stricter; writes it with `setGuardPolicyLine`; appends one
+`GUARD_POLICY_SET` row (`Old Value: strict`, `Source: command`, `Settled`: both raw
+lines, `Kept By`: `set last`, `set by you`, `scope default`, `stricter` or
+`readable`); and keeps the active directive as a setting write does. The first two
+say nothing; the others add one line to the step's `change_notices`, for example:
 
-> This work has two settings for how closely AI-DLC checks changes, and they disagree, so AI-DLC checks everything for now. Do you want it to keep checking everything, carry on with a note when something you approved changes, or also skip some of its own checks? I'll ask again until you choose.
+> This work had two settings for how closely AI-DLC checks changes, and they disagreed. The record does not say which was set last, so AI-DLC keeps the stricter one: it checks everything. You can change it any time.
+
+If the row cannot be recorded, nothing is written and `next` says the conflict as
+a statement ("..., so AI-DLC checks everything for now.").
 
 Typing `guard policy relaxed|off` applies the choice through the human-turn
 hook immediately; `guard policy strict` runs the strict setter through the
@@ -1009,7 +1028,7 @@ and do not enforce that scope comparison.
 | `SESSION_ENDED` | `hooks/aidlc-session-end.ts` | Includes `Reason` field from Claude Code |
 | `HUMAN_TURN` | `hooks/aidlc-record-human-turn.ts` (+ per-harness prompt-submit adapters) | One per observed prompt-submit or answered-widget seam unless the driver declares `AIDLC_UNATTENDED=1` or the prompt arrives in a swarm worker's worktree (a worker's brief is the conductor's, not a person's turn, and the worktree record merges back into a main record whose merge refuses every authority row); the approval/interview gate requires one since the last gate resolution, and a stage gate one sent after the gate was shown. A turn that was only a command to AIDLC (an AIDLC command (`/aidlc ...`, `/aidlc-<runner> ...`, `$aidlc ...` with a flag, scope, verb or noun that `next` reads; words alone after `/aidlc` or `$aidlc`, such as `/aidlc approve the code plan`, are a reply kept without the entry, and so is other text that starts with a slash), or a typed switch) carries `Reply: command`: it is presence for what the command asks for, but a decision on an open question (a stage gate, an answer, a Plan Approval correction, a recovery ask) does not count it as a reply, and the refusal tells the conductor to carry out the command and leave the question open. A question about a switch ("skip plan approval?") is the agent's to answer and carries no mark; an older record's `Reply: question` for one is read the same way as a command turn. This is presence/freshness evidence, not an authenticated transcript or proof that later caller-supplied decision text was authored by the human. The row's optional `Message Id:` names the message record the hook wrote for the turn (`aidlc/.aidlc-sessions/messages/<id>.json`: the words as delivered and the typed settings); rows without it are read as before. |
 | `HOST_TURN` | `hooks/aidlc-record-human-turn.ts` (the Kiro CLI and Kiro IDE adapters decide for their hosts) | Advisory, never a human turn: a prompt the host made for the agent (a Kiro Workflows brief or finish notice, a Kiro sub-agent synthesis prompt, a Claude Code background-task notification) reached the prompt-submit seam and was not counted as the person's turn. Told apart by the host's own record or by the whole host sentence; anything unknown is a person's turn. Fields: optional Session, `Origin: host`, Reason, Source (`record`, `template`); never the prompt text, and no message record is written for it. `HUMAN_TURN` rows carry `Origin: person` and `Source: typed` or `picker` |
-| `SUBAGENT_COMPLETED` | `hooks/aidlc-log-subagent.ts` | Records subagent completion via SubagentStop hook. For a reviewer with open review requests, `Review File Digest` carries `<review file>=<sha256 or absent>` per request: what the reviewer left when it finished. `log review --verdict` compares it with the bytes it records; a difference marks the verdict row `Review Edited After Reviewer: yes` (the verdict stands as the file reads) and the approval gate tells the person in one line that the review file was edited after the reviewer finished (under relaxed or off, as an accepted change said once with the verdict). No row of any agent since a request is what marks a verdict `Reviewer Finished Before Verdict: no` on a host that declares `agentFinishRecorded` (see `REVIEW_COMPLETED`) |
+| `SUBAGENT_COMPLETED` | `hooks/aidlc-log-subagent.ts` | Records subagent completion via SubagentStop hook; reserved from the public audit CLI, so only the hook that saw the host's completion writes it. For a reviewer with open review requests, `Review File Digest` carries `<review file>=<sha256 or absent>` per request: what the reviewer left when it finished. `log review --verdict` compares it with the bytes it records; a difference marks the verdict row `Review Edited After Reviewer: yes` (the verdict stands as the file reads) and the approval gate tells the person in one line that the review file was edited after the reviewer finished (under relaxed or off, as an accepted change said once with the verdict). No row of any agent since a request is what marks a verdict `Reviewer Finished Before Verdict: no` on a host that declares `agentFinishRecorded` (see `REVIEW_COMPLETED`) |
 | `SUBAGENT_PROMPT_UNMATCHED` | `tools/aidlc-audit.ts` | Advisory, never a human turn: the Copilot adapter's `record-human-turn` saw a prompt within seconds of a subagent start in the same chat that matched no recorded subagent brief. The prompt is not counted as the person's turn (`Counted: no`); the Reason says whether no brief matched or the brief record could not be read |
 | `REVIEW_VERDICT_DICTATED` | reserved (no longer written; historical rows only) | No longer written. Earlier releases had the plan-approval guard record a reviewer dispatch whose brief carried a rendered `**Verdict:**` line. The reviewer now says so itself: its review file carries one rendered `**Verdict Dictated:** yes\|no` line, which `log review --verdict` records as written on `REVIEW_COMPLETED` (`Review Verdict Dictated`); on `yes` the verdict command says in one line that the reviewer was told what to conclude before it looked, and the approval gate says it once more under strict. Fields of the historical rows: `Agent Type`, `Verdict`, `Tool`, `Request Id`. Kept registered so audits and worktree deltas written before still read and merge |
 | `REVIEWER_SCOPE_BLOCKED` | `hooks/aidlc-reviewer-scope.ts` | A per-unit reviewer's tool call refused for reaching into sibling units' `construction/` paths (the reviewer-module read-scope bound); one row per refusal |
@@ -1506,7 +1525,8 @@ first, then `next` shows the gate again; when the refused step was the person's
 approval, the same approval runs again, so they are not asked twice); a stage
 reported before its outputs or its code exist (`REQUIRED_ARTIFACTS_MISSING`,
 `REQUIRED_SOURCE_WORK_MISSING`) offers `produce-stage-output`, the refusal's own
-sentence, which ends with the same report again; the source changed after its
+sentence, which ends with the same report again (for missing code, the second
+report puts the approval question to the person with where AI-DLC looked); the source changed after its
 review (`SOURCE_REVIEW_STALE`, the source still readable) offers the one
 `start-recovery-review`, as a changed output does, and that remedy names its
 exact request; and a review pass the cap refuses with nobody having asked for it

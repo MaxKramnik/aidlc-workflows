@@ -2626,14 +2626,22 @@ function handleAnswer(args: string[]): void {
       // asked since). A question asked after it waits for the next reply,
       // unless the person's message that answered it arrived before it was
       // logged: then the agent names that message instead of asking again.
+      // The steps for a reply the hooks missed hold only when the person's
+      // reply did not answer this question: said bare beside a message that
+      // did, they told the person an answer that had arrived was lost.
       const late = messagesBeforeQuestion(pd, flags.stage, flags.unit);
+      const missed = unattendedHumanPresenceHint(pd);
+      if (late.length > 0) {
+        error(
+          `Cannot record this answer: the question was logged after the person's reply. ${lateQuestionHint(late)}` +
+            (missed === "" ? "" : ` If no message of theirs answers it:${missed}`),
+        );
+      }
       error(
-        (late.length > 0
-          ? `Cannot record this answer: the question was logged after the person's reply. ${lateQuestionHint(late)}`
-          : "Cannot record this answer because no new human reply has arrived for the question. "
-            + "Wait for the human to type an answer, then try again."
-            + commandTurnHint(pd))
-          + unattendedHumanPresenceHint(pd),
+        "Cannot record this answer because no new human reply has arrived for the question. "
+          + "Wait for the human to type an answer, then try again."
+          + commandTurnHint(pd)
+          + missed,
       );
     }
     // Where the person replied in a picker, an answer none of their picks

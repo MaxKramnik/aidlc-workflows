@@ -737,6 +737,13 @@ export function pausedLine(plugin: string, base: string, offCommand: string | nu
       : `To turn ${plugin} off as well: ${offCommand}.`);
 }
 
+/** The one line a selection change says, once, when it turns `plugin`'s base
+ *  back on; `when` is when what the plugin adds comes back (`nextCompose`).
+ *  No record says whether a paused plugin added anything, hence "anything". */
+export function resumedLine(plugin: string, base: string, when: string): string {
+  return `${base} is on again, so ${plugin} runs again; anything ${plugin} adds to other stages and agents comes back ${when}.`;
+}
+
 /** The base a composed plugin builds on, from its stamp in `dataDir`. */
 export function composedPluginBase(dataDir: string, plugin: string): string | null {
   if (!/^[a-z][a-z0-9-]*$/.test(plugin)) return null;
@@ -2221,6 +2228,24 @@ export function claudeTranscriptOrigin(transcriptPath: unknown, promptId: unknow
     return { kind: "host", reason: turnOrigin ?? (typeof origin === "string" ? origin : "system"), source: "record" };
   }
   return { kind: "person", source: "record" };
+}
+
+// Who wrote a message Claude Code fed into a running turn. The transcript keeps
+// it as an attachment entry, not a user row: {type: "attachment", attachment:
+// {type: "queued_command", origin: {kind}}} (measured 2.1.296: `human` for what
+// the person typed while the agent worked; a background task's notice, a
+// coordinator or peer agent and an auto-continuation carry their own kind).
+// Null for any other entry and for one with no origin (older builds).
+const CLAUDE_QUEUED_HOST_ORIGINS = new Set(["task-notification", "coordinator", "peer", "auto-continuation"]);
+export function claudeQueuedMessageOrigin(entry: Record<string, unknown>): "person" | "host" | null {
+  const attachment = entry.type === "attachment" ? entry.attachment : undefined;
+  if (attachment === null || typeof attachment !== "object") return null;
+  const queued = attachment as Record<string, unknown>;
+  const origin = queued.type === "queued_command" && queued.origin !== null && typeof queued.origin === "object"
+    ? (queued.origin as Record<string, unknown>).kind
+    : undefined;
+  if (origin === "human") return "person";
+  return typeof origin === "string" && CLAUDE_QUEUED_HOST_ORIGINS.has(origin) ? "host" : null;
 }
 
 // Kiro's plain-text hook channel must carry UTF-8 without terminal protocol
@@ -21980,7 +22005,7 @@ const SOURCE_FINGERPRINT_HARD_EXCLUDED_NAMES = [
   "node_modules",
   "venv",
 ] as const;
-const SOURCE_FINGERPRINT_HARD_EXCLUDED_DIRS = new Set<string>(
+export const SOURCE_FINGERPRINT_HARD_EXCLUDED_DIRS: ReadonlySet<string> = new Set<string>(
   SOURCE_FINGERPRINT_HARD_EXCLUDED_NAMES,
 );
 
@@ -23437,6 +23462,17 @@ function pathIsWithinRoot(root: string, target: string): boolean {
       !rel.startsWith(`..${sep}`)
     )
   );
+}
+
+// How the source listing names what a link leads to: the target's own path
+// when it lies inside the root, else the link's path marked `@target`. The walk
+// names the entries below a link this way, and a source claim through a link
+// is keyed the same way (sourceClaimCheckout), so the claim covers what the
+// walk lists.
+function linkTargetListingRel(rootReal: string, target: string, linkListingRel: string): string {
+  return pathIsWithinRoot(rootReal, target)
+    ? relative(rootReal, target).split(sep).join("/")
+    : `${linkListingRel}@target`;
 }
 
 interface SourceSymlinkResolution {
@@ -25071,9 +25107,7 @@ function filesystemSourceIdentity(
             ) {
               continue;
             }
-            const targetListingRel = internal
-              ? targetRelNative.split(sep).join("/")
-              : `${childListingRel}@target`;
+            const targetListingRel = linkTargetListingRel(rootReal, target, childListingRel);
             if (
               recordIdentity &&
               recordFile(
@@ -25095,9 +25129,7 @@ function filesystemSourceIdentity(
               snapshotEligible &&
               internal &&
               !existsSync(join(target, ".git"));
-            const targetListingRel = internal
-              ? targetSnapshotRel
-              : `${childListingRel}@target`;
+            const targetListingRel = linkTargetListingRel(rootReal, target, childListingRel);
             if (earlierOutput) earlierOutputDepth += 1;
             if (
               !walk(
@@ -25643,7 +25675,7 @@ function sourceListingFieldDecode(value: string): string | null {
   return decoded;
 }
 
-function splitSourcePathKey(key: string): { repo: string; path: string } | null {
+export function splitSourcePathKey(key: string): { repo: string; path: string } | null {
   const separator = key.indexOf("\0");
   if (separator === -1 || key.indexOf("\0", separator + 1) !== -1) return null;
   const repo = key.slice(0, separator);
@@ -26254,6 +26286,69 @@ export function registryExcludedSourceKeys(
   return excluded;
 }
 
+// The checkout that judges a source claim, the claim's path within it, and the
+// path the source listing knows it by. A claim with no repo field whose path
+// lies inside a checkout nested under the project (a worktree or clone the
+// project's git does not track) is judged by that checkout's own git: the
+// outer repository's .gitignore only says the outer repository does not track
+// that folder. The innermost folder on the path with a real .git entry wins;
+// lstat only, so a link or a junction on the way is not followed, except one
+// that leads to a checkout outside the project (a junction to a clone kept
+// elsewhere): its own git judges the claim, and the claim is keyed as the walk
+// lists what the link leads to (linkTargetListingRel). A claim through any
+// other link keeps the link rules below.
+function sourceClaimCheckout(
+  repoRoot: string,
+  path: string,
+  nestedAllowed: boolean,
+): { dir: string; path: string; listingPath: string } {
+  let claim = { dir: repoRoot, path, listingPath: path };
+  if (!nestedAllowed) return claim;
+  let rootReal: string;
+  try {
+    rootReal = realpathSync(repoRoot);
+  } catch {
+    return claim;
+  }
+  const trailing = path.endsWith("/") ? "/" : "";
+  const parts = path.replace(/\/+$/, "").split("/");
+  // A folder claim may name the link itself; a file claim names a file below.
+  const folders = trailing ? parts.length : parts.length - 1;
+  let dir = repoRoot;
+  for (let at = 0; at < folders; at++) {
+    dir = join(dir, parts[at]);
+    let entry: ReturnType<typeof lstatSync>;
+    try {
+      entry = lstatSync(dir);
+    } catch {
+      return claim;
+    }
+    const rest = parts.slice(at + 1).join("/");
+    const restPath = rest === "" ? "" : `${rest}${trailing}`;
+    if (entry.isSymbolicLink()) {
+      const target = resolveSourceSymlinkTarget(rootReal, dir)?.target ?? null;
+      if (target === null || pathIsWithinRoot(rootReal, target)) return claim;
+      try {
+        if (!statSync(target).isDirectory()) return claim;
+        const git = lstatSync(join(target, ".git"));
+        if (!git.isDirectory() && !git.isFile()) return claim;
+      } catch {
+        return claim;
+      }
+      const linked = linkTargetListingRel(rootReal, target, parts.slice(0, at + 1).join("/"));
+      return { dir: target, path: restPath, listingPath: `${linked}/${restPath}` };
+    }
+    if (!entry.isDirectory() || at + 1 >= parts.length) return claim;
+    try {
+      const git = lstatSync(join(dir, ".git"));
+      if (git.isDirectory() || git.isFile()) claim = { dir, path: restPath, listingPath: path };
+    } catch {
+      // No .git entry here: the folder belongs to the checkout above it.
+    }
+  }
+  return claim;
+}
+
 function ignoredSourceClaimReason(
   sourceRepoDir: string,
   path: string,
@@ -26680,15 +26775,18 @@ function validateUnitSourceManifestBytes(
     }
     const normalized = normalizeManifestSourcePath(candidate.path);
     if ("reason" in normalized) continue;
-    const sourceRepoDir =
+    const claim = sourceClaimCheckout(
       worktreeRelative
         ? projectDir
         : canonicalRepo === undefined
           ? projectDir
-          : repoDir(projectDir, canonicalRepo);
-    seedGitSourceClaimIgnorePath(
-      sourceRepoDir,
+          : repoDir(projectDir, canonicalRepo),
       normalized.path,
+      !worktreeRelative && canonicalRepo === undefined,
+    );
+    seedGitSourceClaimIgnorePath(
+      claim.dir,
+      claim.path,
       sourceClaimValidation,
     );
   }
@@ -26731,15 +26829,18 @@ function validateUnitSourceManifestBytes(
     ) {
       return { ok: false, reason: `writes[${index}].path is inside the framework record/shell exclusions` };
     }
-    const sourceRepoDir =
+    const claim = sourceClaimCheckout(
       worktreeRelative
         ? projectDir
         : canonicalRepo === undefined
           ? projectDir
-          : repoDir(projectDir, canonicalRepo);
-    const ignoredReason = ignoredSourceClaimReason(
-      sourceRepoDir,
+          : repoDir(projectDir, canonicalRepo),
       normalized.path,
+      !worktreeRelative && canonicalRepo === undefined,
+    );
+    const ignoredReason = ignoredSourceClaimReason(
+      claim.dir,
+      claim.path,
       normalized.prefix,
       pathModeIndexes,
       sourceClaimValidation,
@@ -26749,8 +26850,8 @@ function validateUnitSourceManifestBytes(
       return { ok: false, reason: `writes[${index}].path: ${ignoredReason}` };
     }
     const symlinkReason = symlinkClaimTargetReason(
-      sourceRepoDir,
-      normalized.path,
+      claim.dir,
+      claim.path,
       normalized.prefix,
       carriesWorkspaceShell,
       pathModeIndexes,
@@ -26759,7 +26860,7 @@ function validateUnitSourceManifestBytes(
     if (symlinkReason !== null) {
       return { ok: false, reason: `writes[${index}].path: ${symlinkReason}` };
     }
-    const key = sourcePathKey(canonicalRepo ?? "", normalized.path);
+    const key = sourcePathKey(canonicalRepo ?? "", claim.listingPath);
     if (seen.has(key)) return { ok: false, reason: `writes[${index}] duplicates a normalized source claim` };
     seen.add(key);
     if (normalized.prefix) prefixes.push(key);
