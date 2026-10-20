@@ -31,8 +31,10 @@
 // receipt) waits while the plan does (the person's answer at the held gate and
 // the recovery remedy they picked excepted); a jump waits for the person's
 // move: the restart they picked at the recovery question, or one they asked
-// for, unless the engine's last step was superseded or is its Code Generation
-// recovery question. While the person is editing the plan
+// for, unless the engine's last step was superseded (a `jump execute` the
+// agent's own settled `next --stage` printed on this state excepted) or is its
+// Code Generation recovery question and the jump is one it offers or not the
+// choice the person just picked there. While the person is editing the plan
 // files themselves, those files are theirs (personIsEditingPlanFile). Three
 // kinds of files pass too: the composer's grid proposal, a person's answer text
 // and a person's request file, which the engine reads and nothing else.
@@ -121,11 +123,20 @@ import {
   resolveBoltDag,
   resolveProjectFlag,
   resolveProjectDirFromHook,
+  nextStageClaimSha256,
   selectedRecordIsFinished,
+  stateDigest,
   stateFilePath,
   worktreesDir,
   writeGuardStoodAside,
+  ActiveDirectiveLockFolderHeldError,
+  activeDirectiveLockHeldAfterStepLine,
+  activeDirectiveLockHeldNote,
+  markPersonLineHeardThisTurn,
+  personLineHeardThisTurn,
+  takeActiveDirectiveReleaseHeld,
 } from "../tools/aidlc-lib.ts";
+import { LOCK_FOLDER_HELD_SAID_KEY } from "../tools/aidlc-lock-line.ts";
 import type { planApprovalAskState } from "../tools/aidlc-plan-approval-ask.ts";
 import { aidlcToolInvocation, quoteCommandArgument } from "../tools/aidlc-runtime-paths.ts";
 import { RECORDABLE_PROJECT_BYPASSES } from "../tools/aidlc-settings.ts";
@@ -1470,45 +1481,78 @@ function isSelectedGuardRestartContinuation(
 interface EngineCommandContext {
   gateHeld: boolean;
   marker: ActiveDirectiveMarker | null;
-  jumpAdmitted: () => boolean;
+  jumpAdmitted: (jump: JumpCommand) => boolean;
+}
+
+// The jump tool's verb (`execute` or `reopen`) and its `--target`.
+interface JumpCommand {
+  verb: string;
+  target: string | undefined;
 }
 
 const NO_ENGINE_CONTEXT: EngineCommandContext = { gateHeld: false, marker: null, jumpAdmitted: () => false };
 
-// The engine's last step was delivered as issued, and it is not its Code
-// Generation recovery question, whose own picked restart is the one jump it
-// carries out (isSelectedGuardRestartContinuation), bound to the state it was
-// picked at. The report that opens the gate moves the state and writes no step,
-// so the step the person answers there is the one the engine issued last
+// The engine's last step leaves the jump to the person's turn. A superseded
+// step waits for a fresh `next`, with one exception: Copilot's settle
+// supersedes the step after every print, `next --stage`'s jump print included,
+// so a `jump execute` to the stage the state-bound step's settled claim asked
+// for with `next --stage`, on the state as it is now, is the agent carrying
+// that print out. A picked restart's own `next` is not (its claim carries the
+// pick, and the settle keeps the question only for its exact print); a
+// `next --stage` carrying anything else, a stage that is no identifier, and a
+// step with no settled claim (a compaction, a status sync) fall to the wait.
+// At its Code Generation recovery question, a restart the question offers runs
+// only as the person's pick of it (isSelectedGuardRestartContinuation), bound
+// to the state it was picked at; a Unit reopen it offers has no pick path
+// (that check reads `jump execute` only), so it stays refused while this
+// question is the published step, picked or not; and right after they
+// picked one of its choices exactly (the hook's record on the current step)
+// another jump goes against that pick. Any other jump is their own move. The
+// report that opens the gate moves the state and writes no
+// step, so the step the person answers there is the one the engine issued last
 // (readIssuedDirectiveMarker); whether their words still stand is
 // personSpokeSinceGate's. With no step on record there is nothing to wait for.
 // Parked work's last step is the park, which no issued step outlives.
-function lastStepAdmitsPersonsMoves(projectDir: string): boolean {
+function lastStepAdmitsPersonsMoves(projectDir: string, jump: JumpCommand): boolean {
   try {
     const state = readFileSync(stateFilePath(projectDir), "utf-8");
     if ((getField(state, "Parked") ?? "").trim().length > 0) return true;
-    const marker = readActiveDirectiveMarker(projectDir, state) ?? readIssuedDirectiveMarker(projectDir);
+    const current = readActiveDirectiveMarker(projectDir, state);
+    const marker = current ?? readIssuedDirectiveMarker(projectDir);
     if (marker === null) return true;
-    return marker.delivery !== "superseded" &&
-      !(marker.kind === "ask" && marker.ask_type === GUARD_RECOVERY_ASK_TYPE);
+    if (marker.delivery === "superseded") {
+      const attempt = current?.active_attempt;
+      const claim = jump.target === undefined ? null : nextStageClaimSha256(jump.target);
+      return jump.verb === "execute" && claim !== null && attempt?.status === "settled" &&
+        attempt.command_kind === "next" && attempt.command_sha256 === claim &&
+        attempt.guard_recovery_selection_sha256 === undefined &&
+        attempt.issued_state_sha256 === stateDigest(state);
+    }
+    if (marker.kind !== "ask" || marker.ask_type !== GUARD_RECOVERY_ASK_TYPE) return true;
+    const reply = current?.guard_recovery_response;
+    return jump.target !== undefined &&
+      !(marker.remedies ?? []).some(({ operation }) =>
+        (operation?.kind === "restart-stage" || operation?.kind === "reopen-unit") && operation.stage === jump.target) &&
+      !(reply?.picked_by === "person" && reply.selected_op && reply.feedback_sha256 === undefined);
   } catch {
     return false;
   }
 }
 
 // A jump is the person's move: the restart they picked at the engine's recovery
-// question, or one they asked for since the last decision, unless the engine's
-// last step was superseded or is its Code Generation recovery question. The jump
-// tool checks neither.
+// question, or one they asked for since the last decision that the last step
+// does not hold back (lastStepAdmitsPersonsMoves). The jump tool checks
+// neither.
 function jumpIsPersonsMove(
   projectDir: string,
   cwd: string,
   command: unknown,
   state: string,
   marker: ActiveDirectiveMarker | null,
+  jump: JumpCommand,
 ): boolean {
   return (typeof command === "string" && isSelectedGuardRestartContinuation(projectDir, cwd, command, state, marker)) ||
-    (personSpokeSinceGate(projectDir, { requests: true }) && lastStepAdmitsPersonsMoves(projectDir));
+    (personSpokeSinceGate(projectDir, { requests: true }) && lastStepAdmitsPersonsMoves(projectDir, jump));
 }
 
 // The results that open the Code Generation gate or complete the stage.
@@ -1593,7 +1637,7 @@ function engineCommandAdmitted(
     !(report && context.gateHeld && stage === GUARDED_STAGE && result === "approved") &&
     !guardRecoveryAnswerAdmits(context.marker, engineArgs, projectDir)
   ) return false;
-  if (args[0] === "jump" && (args[1] === "execute" || args[1] === "reopen") && !context.jumpAdmitted()) return false;
+  if (args[0] === "jump" && (args[1] === "execute" || args[1] === "reopen") && !context.jumpAdmitted({ verb: args[1], target: lastFlag(args, "--target") })) return false;
   // `next` takes no `--bypass`: on its line the token is one of the person's
   // words ("add a --bypass option"), never a check turned off, as the engine's
   // own reading says (nextLineFlags). Every other command is read whole, as its
@@ -2071,6 +2115,53 @@ async function evaluate(
     );
     return 2;
   };
+  // A program holding the project's folders (on Windows, a dev server's file
+  // watcher) keeps the build's start from being recorded. Where the fence
+  // stands aside (off, relaxed, or the person's own switch) the call goes on
+  // with one line a turn and records no pass for a start that was not
+  // published. With the fence up it is refused: a write let through now would
+  // read as drift to the next strict call, which asks for the plan again.
+  const fenceStandsAside = (): boolean => {
+    try {
+      const marker = readActiveDirectiveMarker(projectDir, state ?? "");
+      return codeGenerationPlanApprovalFence(
+        projectDir,
+        { unit: marker?.unit ?? marker?.units?.[0] ?? null },
+        { hookInput: parsed },
+      ).decision === "stand-aside";
+    } catch {
+      return false; // An unreadable fence stays up.
+    }
+  };
+  // Once a turn, whichever of its lines: it stays true until the program stops.
+  const sayLockHeldOnce = (line: string | null): void => {
+    if (line === null) return;
+    const session = typeof parsed?.session_id === "string" ? parsed.session_id : "";
+    if (session && personLineHeardThisTurn(projectDir, session, LOCK_FOLDER_HELD_SAID_KEY)) return;
+    writeGuardStoodAside(line);
+    if (session) markPersonLineHeardThisTurn(projectDir, session, LOCK_FOLDER_HELD_SAID_KEY);
+  };
+  const lockFolderHeld = (error: unknown): number | null => {
+    if (!(error instanceof ActiveDirectiveLockFolderHeldError)) return null;
+    if (!fenceStandsAside()) {
+      if (!error.personLine) return refuseProvenanceFailure(errorMessage(error));
+      recordHookDrop(projectDir, HOOK_NAME, error.message);
+      process.stderr.write(`${oneLine(error.message)}\n`);
+      return 2;
+    }
+    recordHookDrop(projectDir, HOOK_NAME, error.message);
+    sayLockHeldOnce(activeDirectiveLockHeldNote());
+    return 0;
+  };
+  // This call and its record went through, but its own release left the lock
+  // folder held, so the next one meets it. With the fence up it says nothing:
+  // the next write is refused with the line, which is then true. The line is
+  // said only as the call's whole output (one JSON line on Claude Code); where
+  // the call prints more, the next step says it.
+  const sayOwnReleaseHeld = (otherOutput: boolean): void => {
+    if (!takeActiveDirectiveReleaseHeld() || otherOutput || !fenceStandsAside()) return;
+    sayLockHeldOnce(activeDirectiveLockHeldAfterStepLine());
+  };
   // `lead` false: the reason is already a whole refusal that says what cannot happen.
   // `settingNote` false: a question waiting on the person, where the setting is not in play.
   const refuseExecutionIneligible = (reason: string, lead = true, settingNote = true): number => {
@@ -2134,8 +2225,8 @@ async function evaluate(
             {
               gateHeld: codeGenerationGateHeld(state),
               marker: activeDirective,
-              jumpAdmitted: () =>
-                toolName === "Bash" && jumpIsPersonsMove(projectDir, cwd, toolInput.command, state ?? "", activeDirective),
+              jumpAdmitted: (jump) =>
+                toolName === "Bash" && jumpIsPersonsMove(projectDir, cwd, toolInput.command, state ?? "", activeDirective, jump),
             },
           )
         : {
@@ -2438,11 +2529,14 @@ async function evaluate(
         }
       }
     } catch (e) {
+      const held = lockFolderHeld(e);
+      if (held !== null) return held;
       // Source that moved after approval never stops the build (it is one
       // notice line) unless it moved while the start was being published, so a
       // start that throws is a provenance failure.
       return refuseProvenanceFailure(errorMessage(e));
     }
+    sayOwnReleaseHeld(!verdict.block && changeNotices.length > 0);
     if (!verdict.block) {
       for (const notice of changeNotices) process.stdout.write(`${notice}\n`);
     }
@@ -2510,15 +2604,20 @@ async function evaluate(
       // approval still needs source provenance before execution. Reuse the
       // locked start transaction even when edited content made the verdict fail.
       // This hook emits its own stand-aside row below, so begin only reports drift.
+      let printed = 0;
       try {
         for (const notice of beginCodeGenerationBatch(
           projectDir, selected.map(({ target }) => target), { recordContinuation: false }, issued,
         )) {
           process.stdout.write(`${notice}\n`);
+          printed++;
         }
       } catch (e) {
+        const held = lockFolderHeld(e);
+        if (held !== null) return held;
         return refuseProvenanceFailure(errorMessage(e));
       }
+      sayOwnReleaseHeld(printed > 0 || guardStandAsideSpeaks(gate));
       // The row is written once the build has started (the start just held and
       // released the same lock), so it never claims a pass that did not happen.
       // It is this fence's account of what it let through, not approval
